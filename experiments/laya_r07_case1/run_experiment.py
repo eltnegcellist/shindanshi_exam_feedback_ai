@@ -169,28 +169,57 @@ def main():
         model_path=os.path.join(model_dir,"model.onnx")
     agent=ONNXAgent(model_dir,onnx_path=model_path)
 
+    # Flatten all 4,800 semantic questions and evaluate them in ONNX batches.
+    # This keeps the exact same state/question semantics as system_one(), but avoids
+    # 800 separate session.run calls.
+    from laya.common import QTYPES, build_sequence, collate_items, temp_bucket
+
     feature_names=[k for q in ("q1","q2","q3","q4") for k in CRITERIA[q]]
     X=np.full((len(data),len(feature_names)),np.nan,dtype=float)
     fidx={n:i for i,n in enumerate(feature_names)}
-    raw_rows=[]
-    t0=time.time()
+    jobs=[]
     for i,row in enumerate(data):
         qs=split_questions(row["answer"])
-        rec={"id":row["id"],"score":row["score"]}
         for qn in ("q1","q2","q3","q4"):
             state={
                 "exam":"中小企業診断士2次筆記試験 令和7年度 事例I",
                 "question":qn,
                 "answer":qs.get(qn,""),
             }
-            res=agent.system_one(state,laya_questions(CRITERIA[qn]),max_len=1024,head_max_len=256)
-            for name,ans in res["answers"].items():
-                v=float(ans["noul"])
-                X[i,fidx[name]]=v
-                rec[name]=v
+            for name,instruction in CRITERIA[qn].items():
+                q=agent._to_internal({"type":"noul","instructions":instruction})
+                seq,markers=build_sequence(agent.tok,state,q,1024,256)
+                jobs.append((i,name,{"ids":seq,"markers":markers,"qtype":QTYPES["noul"]}))
+
+    batch_size=64
+    t0=time.time()
+    qt=QTYPES["noul"]
+    for bs in range(0,len(jobs),batch_size):
+        chunk=jobs[bs:bs+batch_size]
+        b=collate_items([[z[2] for z in chunk]],agent.tok.pad_token_id)
+        ort_inputs={
+            "input_ids":b["input_ids"].numpy().astype(np.int64),
+            "attention_mask":b["attention_mask"].numpy().astype(np.int64),
+            "marker_pos":b["marker_pos"].numpy().astype(np.int64),
+            "marker_mask":b["marker_mask"].numpy().astype(bool),
+            "qtype":b["qtype"].numpy().astype(np.int64),
+        }
+        logits=agent.session.run(["logits"],ort_inputs)[0]
+        for r,(answer_i,name,item) in enumerate(chunk):
+            k=len(item["markers"])
+            t_scale=agent.temperature_by_options.get(temp_bucket(qt,k),agent.temperature[qt])
+            z=logits[r,:k]/t_scale
+            p=np.exp(z-z.max()); p=p/p.sum()
+            X[answer_i,fidx[name]]=float(p[1])
+        if (bs//batch_size+1)%5==0 or bs+batch_size>=len(jobs):
+            print(f"Laya batched features {min(bs+batch_size,len(jobs))}/{len(jobs)} elapsed={time.time()-t0:.1f}s",flush=True)
+
+    raw_rows=[]
+    for i,row in enumerate(data):
+        rec={"id":row["id"],"score":row["score"]}
+        for name in feature_names:
+            rec[name]=float(X[i,fidx[name]])
         raw_rows.append(rec)
-        if (i+1)%10==0:
-            print(f"Laya features {i+1}/{len(data)} elapsed={time.time()-t0:.1f}s",flush=True)
 
     if not np.isfinite(X).all():
         raise RuntimeError("Non-finite semantic features")
