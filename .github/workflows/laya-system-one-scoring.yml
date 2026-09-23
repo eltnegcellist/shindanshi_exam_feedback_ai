@@ -1,0 +1,42 @@
+name: Laya System One scoring experiment
+
+on:
+  push:
+    branches:
+      - experiment/laya-system-one-scoring
+    paths:
+      - "experiments/laya_r07_case1/**"
+      - ".github/workflows/laya-system-one-scoring.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "laya[onnx]" scikit-learn scipy pandas
+
+      - name: Run experiment
+        run: |
+          python experiments/laya_r07_case1/run_experiment.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laya-r07-case1-results
+          path: experiments/laya_r07_case1/results/
+          if-no-files-found: warn
